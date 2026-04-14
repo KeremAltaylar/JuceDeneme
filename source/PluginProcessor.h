@@ -2,6 +2,10 @@
 
 #include <juce_audio_processors/juce_audio_processors.h>
 
+#include "Parameters.h"
+#include "StepSequencer.h"
+#include "WarpingSamplerEngine.h"
+
 #if (MSVC)
 #include "ipps.h"
 #endif
@@ -38,6 +42,33 @@ public:
     void getStateInformation (juce::MemoryBlock& destData) override;
     void setStateInformation (const void* data, int sizeInBytes) override;
 
+    juce::AudioProcessorValueTreeState& getAPVTS() { return apvts; }
+
+    void loadSampleFromFile (const juce::File& file);
+
+    SampleData::Ptr getLoadedSampleForUI() const { return loadedSampleForUI; }
+    std::function<void()> onSampleLoaded;
+
 private:
+    void updateSequencerCacheFromApvts();
+    void updateEngineParamsFromApvts();
+
+    juce::AudioFormatManager formatManager;
+    WarpingSamplerEngine samplerEngine;
+    StepSequencer sequencer;
+    juce::AudioProcessorValueTreeState apvts;
+
+    juce::ThreadPool loaderPool { 1 };
+
+    std::array<bool, 16> stepCache {};
+
+    std::atomic<float>* speedParam = nullptr;
+    std::atomic<float>* warpParam = nullptr;
+    std::atomic<float>* sequenceLengthParam = nullptr;
+    std::array<std::atomic<float>*, 16> stepParams {};
+
+    SampleData::Ptr loadedSampleForUI;
+    std::atomic<SampleData*> sampleForAudio { nullptr };
+
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (PluginProcessor)
 };

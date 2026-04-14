@@ -84,6 +84,8 @@ juce_add_plugin("${PROJECT_NAME}"
     # A unique four-character plugin id
     # Note: this must have at least one upper-case character
     PLUGIN_CODE P001
+    IS_SYNTH TRUE
+    NEEDS_MIDI_INPUT TRUE
     FORMATS "${FORMATS}"
 
     # The name of your final executable

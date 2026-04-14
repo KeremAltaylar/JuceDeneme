@@ -11,11 +11,23 @@ PluginProcessor::PluginProcessor()
                        .withOutput ("Output", juce::AudioChannelSet::stereo(), true)
                      #endif
                        )
+     , apvts (*this, nullptr, "PARAMETERS", Parameters::createLayout())
 {
+    formatManager.registerBasicFormats();
+
+    samplerEngine.setSampleSource (&sampleForAudio);
+
+    speedParam = apvts.getRawParameterValue (ParameterIDs::speed);
+    warpParam = apvts.getRawParameterValue (ParameterIDs::warp);
+    sequenceLengthParam = apvts.getRawParameterValue (ParameterIDs::sequenceLength);
+    for (int i = 0; i < 16; ++i)
+        stepParams[(size_t) i] = apvts.getRawParameterValue (ParameterIDs::stepId (i));
 }
 
 PluginProcessor::~PluginProcessor()
 {
+    if (auto* old = sampleForAudio.exchange (nullptr, std::memory_order_acq_rel))
+        old->decReferenceCount();
 }
 
 //==============================================================================
@@ -86,9 +98,8 @@ void PluginProcessor::changeProgramName (int index, const juce::String& newName)
 //==============================================================================
 void PluginProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
 {
-    // Use this method as the place to do any pre-playback
-    // initialisation that you need..
-    juce::ignoreUnused (sampleRate, samplesPerBlock);
+    samplerEngine.prepareToPlay (sampleRate, samplesPerBlock);
+    sequencer.prepare (sampleRate);
 }
 
 void PluginProcessor::releaseResources()
@@ -122,33 +133,48 @@ bool PluginProcessor::isBusesLayoutSupported (const BusesLayout& layouts) const
 void PluginProcessor::processBlock (juce::AudioBuffer<float>& buffer,
                                               juce::MidiBuffer& midiMessages)
 {
-    juce::ignoreUnused (midiMessages);
-
     juce::ScopedNoDenormals noDenormals;
-    auto totalNumInputChannels  = getTotalNumInputChannels();
-    auto totalNumOutputChannels = getTotalNumOutputChannels();
 
-    // In case we have more outputs than inputs, this code clears any output
-    // channels that didn't contain input data, (because these aren't
-    // guaranteed to be empty - they may contain garbage).
-    // This is here to avoid people getting screaming feedback
-    // when they first compile a plugin, but obviously you don't need to keep
-    // this code if your algorithm always overwrites all the output channels.
-    for (auto i = totalNumInputChannels; i < totalNumOutputChannels; ++i)
-        buffer.clear (i, 0, buffer.getNumSamples());
+    const int numSamples = buffer.getNumSamples();
+    const int numChannels = buffer.getNumChannels();
 
-    // This is the place where you'd normally do the guts of your plugin's
-    // audio processing...
-    // Make sure to reset the state if your inner loop is processing
-    // the samples and the outer loop is handling the channels.
-    // Alternatively, you can process the samples with the channels
-    // interleaved by keeping the same state.
-    for (int channel = 0; channel < totalNumInputChannels; ++channel)
+    for (int ch = 0; ch < numChannels; ++ch)
+        juce::FloatVectorOperations::clear (buffer.getWritePointer (ch), numSamples);
+
+    updateEngineParamsFromApvts();
+    updateSequencerCacheFromApvts();
+
+    const int seqLen = (int) (sequenceLengthParam != nullptr ? sequenceLengthParam->load() : 16.0f);
+
+    std::array<StepSequencer::Event, 64> events {};
+    const int eventCount = sequencer.createEventsForBlock (
+        events,
+        getPlayHead(),
+        numSamples,
+        seqLen,
+        stepCache);
+
+    int renderedUpTo = 0;
+    for (int i = 0; i < eventCount; ++i)
     {
-        auto* channelData = buffer.getWritePointer (channel);
-        juce::ignoreUnused (channelData);
-        // ..do something to the data...
+        const auto e = events[(size_t) i];
+        const int segmentLen = juce::jlimit (0, numSamples - renderedUpTo, e.sampleOffset - renderedUpTo);
+        if (segmentLen > 0)
+        {
+            samplerEngine.render (buffer, renderedUpTo, segmentLen);
+            renderedUpTo += segmentLen;
+        }
+
+        if (e.noteOn)
+            samplerEngine.noteOn (60, 1.0f);
+        else
+            samplerEngine.noteOff (60, 0.0f, true);
     }
+
+    if (renderedUpTo < numSamples)
+        samplerEngine.render (buffer, renderedUpTo, numSamples - renderedUpTo);
+
+    midiMessages.clear();
 }
 
 //==============================================================================
@@ -165,17 +191,92 @@ juce::AudioProcessorEditor* PluginProcessor::createEditor()
 //==============================================================================
 void PluginProcessor::getStateInformation (juce::MemoryBlock& destData)
 {
-    // You should use this method to store your parameters in the memory block.
-    // You could do that either as raw data, or use the XML or ValueTree classes
-    // as intermediaries to make it easy to save and load complex data.
-    juce::ignoreUnused (destData);
+    if (auto state = apvts.copyState().createXml())
+        copyXmlToBinary (*state, destData);
 }
 
 void PluginProcessor::setStateInformation (const void* data, int sizeInBytes)
 {
-    // You should use this method to restore your parameters from this memory block,
-    // whose contents will have been created by the getStateInformation() call.
-    juce::ignoreUnused (data, sizeInBytes);
+    if (auto xml = getXmlFromBinary (data, sizeInBytes))
+        apvts.replaceState (juce::ValueTree::fromXml (*xml));
+}
+
+void PluginProcessor::updateSequencerCacheFromApvts()
+{
+    for (int i = 0; i < 16; ++i)
+    {
+        const auto* p = stepParams[(size_t) i];
+        stepCache[(size_t) i] = (p != nullptr && p->load() >= 0.5f);
+    }
+}
+
+void PluginProcessor::updateEngineParamsFromApvts()
+{
+    const float speed = speedParam != nullptr ? speedParam->load() : 1.0f;
+    const bool warpEnabled = warpParam != nullptr ? (warpParam->load() >= 0.5f) : true;
+    samplerEngine.setParameters (speed, warpEnabled);
+}
+
+namespace
+{
+    class SampleLoadJob final : public juce::ThreadPoolJob
+    {
+    public:
+        SampleLoadJob (juce::AudioFormatManager& fm, juce::File f, std::function<void (SampleData::Ptr)> cb)
+            : ThreadPoolJob ("SampleLoadJob"), formatManager (fm), file (std::move (f)), callback (std::move (cb))
+        {
+        }
+
+        JobStatus runJob() override
+        {
+            std::unique_ptr<juce::AudioFormatReader> reader (formatManager.createReaderFor (file));
+            if (reader == nullptr)
+            {
+                juce::MessageManager::callAsync ([cb = callback]() { cb (nullptr); });
+                return jobHasFinished;
+            }
+
+            const int numChannels = (int) reader->numChannels;
+            const int64 numSamples64 = reader->lengthInSamples;
+            if (numChannels <= 0 || numSamples64 <= 0 || numSamples64 > (int64) (30 * reader->sampleRate))
+            {
+                juce::MessageManager::callAsync ([cb = callback]() { cb (nullptr); });
+                return jobHasFinished;
+            }
+
+            juce::AudioBuffer<float> audio (numChannels, (int) numSamples64);
+            reader->read (&audio, 0, (int) numSamples64, 0, true, true);
+
+            auto sample = SampleData::Ptr (new SampleData (std::move (audio), reader->sampleRate));
+            juce::MessageManager::callAsync ([cb = callback, sample]() { cb (sample); });
+            return jobHasFinished;
+        }
+
+    private:
+        juce::AudioFormatManager& formatManager;
+        juce::File file;
+        std::function<void (SampleData::Ptr)> callback;
+    };
+}
+
+void PluginProcessor::loadSampleFromFile (const juce::File& file)
+{
+    if (! file.existsAsFile())
+        return;
+
+    loaderPool.addJob (new SampleLoadJob (formatManager, file, [this] (SampleData::Ptr sample)
+    {
+        loadedSampleForUI = sample;
+        auto* newRaw = sample.get();
+        if (newRaw != nullptr)
+            newRaw->incReferenceCount();
+
+        if (auto* old = sampleForAudio.exchange (newRaw, std::memory_order_acq_rel))
+            old->decReferenceCount();
+
+        if (onSampleLoaded)
+            onSampleLoaded();
+    }), true);
 }
 
 //==============================================================================

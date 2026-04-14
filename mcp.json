@@ -1,0 +1,22 @@
+{
+  "mcpServers": {
+    "github": {
+      "description": "GitHub build tracking (placeholders)",
+      "command": "node",
+      "args": ["path/to/mcp-github-server.js"],
+      "env": {
+        "GITHUB_TOKEN": "__REPLACE_WITH_GITHUB_TOKEN__",
+        "GITHUB_REPO": "owner/repo"
+      }
+    },
+    "brave_search": {
+      "description": "Brave Search for JUCE 8 sampler/warping docs (placeholders)",
+      "command": "node",
+      "args": ["path/to/mcp-brave-search-server.js"],
+      "env": {
+        "BRAVE_API_KEY": "__REPLACE_WITH_BRAVE_API_KEY__"
+      }
+    }
+  }
+}
+
