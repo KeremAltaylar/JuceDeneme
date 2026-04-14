@@ -214,8 +214,19 @@ jobs:
           iscc "packaging\installer.iss"
           mv "packaging/Output/${{ env.ARTIFACT_NAME }}.exe" "${{ env.ARTIFACTS_PATH }}/"
 
-      - name: Codesign with Azure Trusted Signing
+      - name: Detect Windows signing secrets
         if: ${{ runner.os == 'Windows' }}
+        env:
+          AZURE_ENDPOINT: ${{ secrets.AZURE_ENDPOINT }}
+        run: |
+          if [ -n "${AZURE_ENDPOINT}" ]; then
+            echo "HAS_WINDOWS_SIGNING=1" >> $GITHUB_ENV
+          else
+            echo "HAS_WINDOWS_SIGNING=0" >> $GITHUB_ENV
+          fi
+
+      - name: Codesign with Azure Trusted Signing
+        if: ${{ runner.os == 'Windows' && env.HAS_WINDOWS_SIGNING == '1' }}
         uses: azure/artifact-signing-action@v1
         with:
           # The Azure Active Directory tenant (directory) ID.
