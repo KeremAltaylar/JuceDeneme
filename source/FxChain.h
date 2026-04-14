@@ -77,7 +77,7 @@ public:
             {
                 float v = x[i] * driveGain;
                 v = std::tanh (v);
-                v = filter.processSample (v);
+                v = filter.processSample (0, v);
                 x[i] = v;
             }
         }
@@ -162,4 +162,3 @@ private:
     std::array<juce::dsp::DelayLine<float, juce::dsp::DelayLineInterpolationTypes::Linear>, 2> delayLines;
     juce::dsp::Reverb reverb;
 };
-
