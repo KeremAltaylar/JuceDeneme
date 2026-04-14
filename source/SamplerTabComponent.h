@@ -22,7 +22,6 @@ public:
         dropZone.onFileDropped = [this] (const juce::File& file)
         {
             loadedFile = file;
-            waveform.setFile (file);
             processor.loadSampleFromFile (slotIndex, file);
             refresh();
         };
@@ -40,6 +39,11 @@ public:
         const int count = processor.getOnsetCount (slotIndex);
         const auto fileName = loadedFile.existsAsFile() ? loadedFile.getFileName() : juce::String ("(none)");
         statusLabel.setText ("File: " + fileName + "    Onsets: " + juce::String (count), juce::dontSendNotification);
+
+        if (auto s = processor.getLoadedSampleForUI (slotIndex))
+            waveform.setSample (s);
+        else
+            waveform.clear();
     }
 
     void resized() override
@@ -65,4 +69,3 @@ private:
     juce::Label statusLabel;
     juce::File loadedFile;
 };
-

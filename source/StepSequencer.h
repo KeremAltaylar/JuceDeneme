@@ -55,7 +55,8 @@ public:
         if (lastStepIndex == -1)
         {
             lastStepIndex = initialStep;
-            events[(size_t) eventCount++] = Event { 0, lastStepIndex };
+            if (eventCount < (int) events.size())
+                events[(size_t) eventCount++] = Event { 0, lastStepIndex };
         }
 
         double ppqNow = ppqStart;
@@ -83,7 +84,10 @@ public:
             if (newStep != lastStepIndex)
             {
                 lastStepIndex = newStep;
-                events[(size_t) eventCount++] = Event { sampleOffset, lastStepIndex };
+                if (eventCount < (int) events.size())
+                    events[(size_t) eventCount++] = Event { sampleOffset, lastStepIndex };
+                else
+                    break;
             }
         }
 
