@@ -9,6 +9,7 @@ public:
     {
         sampleRate = sampleRateIn;
         numChannels = juce::jlimit (1, 2, numChannelsIn);
+        reverbMaxBlockSize = (juce::uint32) juce::jmax (1, maxBlockSize);
 
         juce::dsp::ProcessSpec spec;
         spec.sampleRate = sampleRate;
@@ -27,6 +28,11 @@ public:
         {
             d.reset();
             d.setMaximumDelayInSamples (maxDelaySamples);
+            juce::dsp::ProcessSpec delaySpec;
+            delaySpec.sampleRate = sampleRate;
+            delaySpec.maximumBlockSize = (juce::uint32) juce::jmax (1, maxBlockSize);
+            delaySpec.numChannels = 1;
+            d.prepare (delaySpec);
         }
 
         reverb.reset();
@@ -114,8 +120,16 @@ public:
             reverb.setParameters (p);
 
             juce::dsp::AudioBlock<float> block (buffer);
-            juce::dsp::ProcessContextReplacing<float> ctx (block);
-            reverb.process (ctx);
+            int offset = 0;
+            const int maxChunk = (int) juce::jmax ((juce::uint32) 1, reverbMaxBlockSize);
+            while (offset < ns)
+            {
+                const int chunk = juce::jmin (maxChunk, ns - offset);
+                auto subBlock = block.getSubBlock ((size_t) offset, (size_t) chunk);
+                juce::dsp::ProcessContextReplacing<float> ctx (subBlock);
+                reverb.process (ctx);
+                offset += chunk;
+            }
         }
     }
 
@@ -143,6 +157,7 @@ private:
 
     double sampleRate = 44100.0;
     int numChannels = 2;
+    juce::uint32 reverbMaxBlockSize = 0;
 
     float driveDb = 0.0f;
     float toneHz = 4000.0f;

@@ -28,11 +28,11 @@ public:
         }
     }
 
-    void setSampleSource (int slotIndex, std::atomic<SampleData*>* source)
+    void setSampleSource (int slotIndex, std::function<SampleData::Ptr()> getter)
     {
         if (slotIndex < 0 || slotIndex >= 2)
             return;
-        sampleSources[(size_t) slotIndex] = source;
+        sampleSources[(size_t) slotIndex] = std::move (getter);
     }
 
     void render (juce::AudioBuffer<float>& output, int startSample, int numSamples)
@@ -48,12 +48,12 @@ public:
         if (durationSamplesOut <= 0)
             return;
 
-        auto* src = sampleSources[(size_t) slotIndex];
-        if (src == nullptr)
+        auto& getter = sampleSources[(size_t) slotIndex];
+        if (! getter)
             return;
 
-        auto* sampleRaw = src->load (std::memory_order_acquire);
-        if (sampleRaw == nullptr)
+        auto sample = getter();
+        if (sample == nullptr)
             return;
 
         WarpingVoice* voice = nullptr;
@@ -69,7 +69,7 @@ public:
         if (voice == nullptr)
             voice = &voices[0];
 
-        voice->start (sampleRaw, onsetSampleInSource, durationSamplesOut, velocity);
+        voice->start (std::move (sample), onsetSampleInSource, durationSamplesOut, velocity);
     }
 
 private:
@@ -99,7 +99,7 @@ private:
 
         bool isActive() const { return active; }
 
-        void start (SampleData* sampleIn, int onsetInSource, int durationOutSamples, float velocity)
+        void start (SampleData::Ptr sampleIn, int onsetInSource, int durationOutSamples, float velocity)
         {
             stop();
 
@@ -113,9 +113,8 @@ private:
             onsetInSource = juce::jlimit (0, src.getNumSamples() - 2, onsetInSource);
             samplesRemaining = durationOutSamples;
             level = velocity;
-            sampleIn->incReferenceCount();
-            currentSampleRaw = sampleIn;
-            sourceSampleRate = sampleIn->getSourceSampleRate();
+            currentSample = std::move (sampleIn);
+            sourceSampleRate = currentSample->getSourceSampleRate();
 
             resetPlayback (onsetInSource);
             active = true;
@@ -125,19 +124,15 @@ private:
         {
             active = false;
             samplesRemaining = 0;
-            if (currentSampleRaw != nullptr)
-            {
-                currentSampleRaw->decReferenceCount();
-                currentSampleRaw = nullptr;
-            }
+            currentSample = nullptr;
         }
 
         void render (juce::AudioBuffer<float>& outputBuffer, int startSample, int numSamples)
         {
-            if (! active || currentSampleRaw == nullptr)
+            if (! active || currentSample == nullptr)
                 return;
 
-            const auto& source = currentSampleRaw->getAudio();
+            const auto& source = currentSample->getAudio();
             if (source.getNumSamples() <= 1)
             {
                 stop();
@@ -318,7 +313,7 @@ private:
         bool active = false;
         int samplesRemaining = 0;
 
-        SampleData* currentSampleRaw = nullptr;
+        SampleData::Ptr currentSample;
         double sourceSampleRate = 44100.0;
         double hostSampleRate = 44100.0;
         int numChannels = 2;
@@ -344,7 +339,6 @@ private:
     float speed = 1.0f;
     bool warpEnabled = true;
 
-    std::array<std::atomic<SampleData*>*, 2> sampleSources { nullptr, nullptr };
+    std::array<std::function<SampleData::Ptr()>, 2> sampleSources;
     std::array<WarpingVoice, 8> voices;
 };
-

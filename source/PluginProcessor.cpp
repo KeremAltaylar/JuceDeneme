@@ -15,8 +15,8 @@ PluginProcessor::PluginProcessor()
 {
     formatManager.registerBasicFormats();
 
-    samplerEngine.setSampleSource (0, &sampleForAudio[0]);
-    samplerEngine.setSampleSource (1, &sampleForAudio[1]);
+    samplerEngine.setSampleSource (0, [this]() { return getSampleForAudio (0); });
+    samplerEngine.setSampleSource (1, [this]() { return getSampleForAudio (1); });
 
     speedParam = apvts.getRawParameterValue (ParameterIDs::speed);
     warpParam = apvts.getRawParameterValue (ParameterIDs::warp);
@@ -49,11 +49,9 @@ PluginProcessor::PluginProcessor()
 
 PluginProcessor::~PluginProcessor()
 {
+    const juce::SpinLock::ScopedLockType lock (sharedDataLock);
     for (auto& s : sampleForAudio)
-    {
-        if (auto* old = s.exchange (nullptr, std::memory_order_acq_rel))
-            old->decReferenceCount();
-    }
+        s = nullptr;
 }
 
 //==============================================================================
@@ -124,11 +122,14 @@ void PluginProcessor::changeProgramName (int index, const juce::String& newName)
 //==============================================================================
 void PluginProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
 {
-    samplerEngine.prepare (sampleRate, samplesPerBlock, getTotalNumOutputChannels());
+    lastPreparedBlockSize = juce::jmax (1, juce::jmax (samplesPerBlock, 16384));
+    lastPreparedNumChannels = juce::jmax (1, getTotalNumOutputChannels());
+
+    samplerEngine.prepare (sampleRate, lastPreparedBlockSize.load (std::memory_order_relaxed), lastPreparedNumChannels);
     sequencer.prepare (sampleRate);
 
-    fxChain.prepare (sampleRate, samplesPerBlock, getTotalNumOutputChannels());
-    juce::dsp::ProcessSpec spec { sampleRate, (juce::uint32) samplesPerBlock, (juce::uint32) getTotalNumOutputChannels() };
+    fxChain.prepare (sampleRate, lastPreparedBlockSize.load (std::memory_order_relaxed), lastPreparedNumChannels);
+    juce::dsp::ProcessSpec spec { sampleRate, (juce::uint32) lastPreparedBlockSize.load (std::memory_order_relaxed), (juce::uint32) lastPreparedNumChannels };
     limiter.prepare (spec);
 }
 
@@ -167,6 +168,8 @@ void PluginProcessor::processBlock (juce::AudioBuffer<float>& buffer,
 
     const int numSamples = buffer.getNumSamples();
     const int numChannels = buffer.getNumChannels();
+
+    const int preparedBlockSize = lastPreparedBlockSize.load (std::memory_order_relaxed);
 
     for (int ch = 0; ch < numChannels; ++ch)
         juce::FloatVectorOperations::clear (buffer.getWritePointer (ch), numSamples);
@@ -263,8 +266,15 @@ void PluginProcessor::processBlock (juce::AudioBuffer<float>& buffer,
 
     {
         juce::dsp::AudioBlock<float> block (buffer);
-        juce::dsp::ProcessContextReplacing<float> ctx (block);
-        limiter.process (ctx);
+        int offset = 0;
+        while (offset < numSamples)
+        {
+            const int chunk = juce::jmin (preparedBlockSize, numSamples - offset);
+            auto subBlock = block.getSubBlock ((size_t) offset, (size_t) chunk);
+            juce::dsp::ProcessContextReplacing<float> ctx (subBlock);
+            limiter.process (ctx);
+            offset += chunk;
+        }
     }
 
     if (! hostPlaying && internalPlay)
@@ -465,14 +475,13 @@ void PluginProcessor::loadSampleFromFile (int slotIndex, const juce::File& file)
     loaderPool.addJob (new SampleLoadJob (formatManager, file, slotIndex, [this] (int slot, SampleData::Ptr sample)
     {
         loadedSampleForUI[(size_t) slot] = sample;
-        auto* newRaw = sample.get();
-        if (newRaw != nullptr)
-            newRaw->incReferenceCount();
-
-        if (auto* old = sampleForAudio[(size_t) slot].exchange (newRaw, std::memory_order_acq_rel))
-            old->decReferenceCount();
-
-        onsetCount[(size_t) slot].store (0, std::memory_order_relaxed);
+        {
+            const juce::SpinLock::ScopedLockType lock (sharedDataLock);
+            sampleForAudio[(size_t) slot] = sample;
+            onsetCount[(size_t) slot] = 0;
+            for (int i = 0; i < maxOnsets; ++i)
+                onsetSamples[(size_t) slot][(size_t) i] = 0;
+        }
         if (onSampleLoaded)
             onSampleLoaded (slot);
     }), true);
@@ -490,9 +499,12 @@ void PluginProcessor::analyzeOnsets (int slotIndex)
     loaderPool.addJob (new OnsetAnalyzeJob (sample, slotIndex, maxOnsets, [this] (int slot, std::array<int, 256> onsets, int count)
     {
         const int safeCount = juce::jlimit (0, maxOnsets, count);
-        for (int i = 0; i < maxOnsets; ++i)
-            onsetSamples[(size_t) slot][(size_t) i] = (i < safeCount ? onsets[(size_t) i] : 0);
-        onsetCount[(size_t) slot].store (safeCount, std::memory_order_relaxed);
+        {
+            const juce::SpinLock::ScopedLockType lock (sharedDataLock);
+            for (int i = 0; i < maxOnsets; ++i)
+                onsetSamples[(size_t) slot][(size_t) i] = (i < safeCount ? onsets[(size_t) i] : 0);
+            onsetCount[(size_t) slot] = safeCount;
+        }
         if (onOnsetsAnalyzed)
             onOnsetsAnalyzed (slot);
     }), true);

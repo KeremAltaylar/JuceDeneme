@@ -49,6 +49,14 @@ public:
     void loadSampleFromFile (int slotIndex, const juce::File& file);
     void analyzeOnsets (int slotIndex);
 
+    SampleData::Ptr getSampleForAudio (int slotIndex) const
+    {
+        if (slotIndex < 0 || slotIndex >= 2)
+            return nullptr;
+        const juce::SpinLock::ScopedLockType lock (sharedDataLock);
+        return sampleForAudio[(size_t) slotIndex];
+    }
+
     SampleData::Ptr getLoadedSampleForUI (int slotIndex) const
     {
         if (slotIndex < 0 || slotIndex >= 2)
@@ -60,14 +68,16 @@ public:
     {
         if (slotIndex < 0 || slotIndex >= 2)
             return 0;
-        return onsetCount[(size_t) slotIndex].load (std::memory_order_relaxed);
+        const juce::SpinLock::ScopedLockType lock (sharedDataLock);
+        return onsetCount[(size_t) slotIndex];
     }
 
     int getOnsetSample (int slotIndex, int onsetIndex) const
     {
         if (slotIndex < 0 || slotIndex >= 2)
             return 0;
-        const int count = onsetCount[(size_t) slotIndex].load (std::memory_order_relaxed);
+        const juce::SpinLock::ScopedLockType lock (sharedDataLock);
+        const int count = onsetCount[(size_t) slotIndex];
         onsetIndex = juce::jlimit (0, juce::jmax (0, count - 1), onsetIndex);
         return onsetSamples[(size_t) slotIndex][(size_t) onsetIndex];
     }
@@ -88,12 +98,17 @@ private:
 
     juce::ThreadPool loaderPool { 1 };
 
+    mutable juce::SpinLock sharedDataLock;
+
     std::array<bool, 16> stepCache {};
     std::array<int, 16> stepSamplerCache {};
     std::array<int, 16> stepOnsetCache {};
     std::array<float, 16> stepLengthMsCache {};
 
     double internalPpq = 0.0;
+
+    std::atomic<int> lastPreparedBlockSize { 0 };
+    std::atomic<int> lastPreparedNumChannels { 0 };
 
     std::atomic<float>* speedParam = nullptr;
     std::atomic<float>* warpParam = nullptr;
@@ -119,11 +134,11 @@ private:
     std::atomic<float>* reverbDampingParam = nullptr;
 
     std::array<SampleData::Ptr, 2> loadedSampleForUI;
-    std::array<std::atomic<SampleData*>, 2> sampleForAudio { nullptr, nullptr };
+    std::array<SampleData::Ptr, 2> sampleForAudio;
 
     static constexpr int maxOnsets = 256;
     std::array<std::array<int, (size_t) maxOnsets>, 2> onsetSamples {};
-    std::array<std::atomic<int>, 2> onsetCount { 0, 0 };
+    std::array<int, 2> onsetCount { 0, 0 };
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (PluginProcessor)
 };
