@@ -237,8 +237,8 @@ namespace
             }
 
             const int numChannels = (int) reader->numChannels;
-            const int64 numSamples64 = reader->lengthInSamples;
-            if (numChannels <= 0 || numSamples64 <= 0 || numSamples64 > (int64) (30 * reader->sampleRate))
+            const juce::int64 numSamples64 = reader->lengthInSamples;
+            if (numChannels <= 0 || numSamples64 <= 0 || numSamples64 > (juce::int64) (30 * reader->sampleRate))
             {
                 juce::MessageManager::callAsync ([cb = callback]() { cb (nullptr); });
                 return jobHasFinished;

@@ -141,7 +141,7 @@ private:
             if (idx0 >= source.getNumSamples() - 1)
             {
                 clearCurrentNote();
-                currentSample = nullptr;
+                releaseSample();
                 return;
             }
 

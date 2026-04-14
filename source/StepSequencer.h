@@ -35,6 +35,19 @@ public:
         if (playHead == nullptr || sampleRate <= 0.0)
             return ensureNoteOff (events, eventCount);
 
+#if JUCE_MAJOR_VERSION >= 8
+        const auto position = playHead->getPosition();
+        if (! position.hasValue() || ! position->getIsPlaying())
+            return ensureNoteOff (events, eventCount);
+
+        const auto bpmOpt = position->getBpm();
+        const auto ppqOpt = position->getPpqPosition();
+        if (! bpmOpt.hasValue() || ! ppqOpt.hasValue() || *bpmOpt <= 0.0)
+            return ensureNoteOff (events, eventCount);
+
+        const double bpm = *bpmOpt;
+        const double ppqStart = *ppqOpt;
+#else
         juce::AudioPlayHead::CurrentPositionInfo pos;
         if (! playHead->getCurrentPosition (pos))
             return ensureNoteOff (events, eventCount);
@@ -42,8 +55,11 @@ public:
         if (! pos.isPlaying || pos.bpm <= 0.0)
             return ensureNoteOff (events, eventCount);
 
+        const double bpm = pos.bpm;
         const double ppqStart = pos.ppqPosition;
-        const double ppqPerSample = pos.bpm / (60.0 * sampleRate);
+#endif
+
+        const double ppqPerSample = bpm / (60.0 * sampleRate);
         const double stepPpq = 0.25;
         const int length = juce::jlimit (1, 16, sequenceLength);
 
@@ -118,5 +134,4 @@ private:
     double sampleRate = 44100.0;
     int lastStepIndex = -1;
     bool lastStepWasActive = false;
-    int noteNumber = 60;
 };

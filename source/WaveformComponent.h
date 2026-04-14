@@ -10,15 +10,11 @@ public:
     {
         formatManager.registerBasicFormats();
         thumbnail.addChangeListener (this);
-        thread.startThread();
-        thumbnail.setBackgroundThread (&thread);
     }
 
     ~WaveformComponent() override
     {
         thumbnail.removeChangeListener (this);
-        thumbnail.setBackgroundThread (nullptr);
-        thread.stopThread (1000);
     }
 
     void setFile (const juce::File& file)
@@ -30,7 +26,7 @@ public:
 
     void clear()
     {
-        currentFile = {};
+        currentFile = juce::File();
         thumbnail.setSource (nullptr);
         repaint();
     }
@@ -65,7 +61,5 @@ private:
     juce::AudioFormatManager formatManager;
     juce::AudioThumbnailCache thumbnailCache;
     juce::AudioThumbnail thumbnail;
-    juce::TimeSliceThread thread { "Waveform" };
     juce::File currentFile;
 };
-
