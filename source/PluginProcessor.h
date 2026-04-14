@@ -4,7 +4,8 @@
 
 #include "Parameters.h"
 #include "StepSequencer.h"
-#include "WarpingSamplerEngine.h"
+#include "DualWarpingSamplerEngine.h"
+#include "FxChain.h"
 
 #if (MSVC)
 #include "ipps.h"
@@ -44,31 +45,84 @@ public:
 
     juce::AudioProcessorValueTreeState& getAPVTS() { return apvts; }
 
-    void loadSampleFromFile (const juce::File& file);
+    void loadSampleFromFile (int slotIndex, const juce::File& file);
+    void analyzeOnsets (int slotIndex);
 
-    SampleData::Ptr getLoadedSampleForUI() const { return loadedSampleForUI; }
-    std::function<void()> onSampleLoaded;
+    SampleData::Ptr getLoadedSampleForUI (int slotIndex) const
+    {
+        if (slotIndex < 0 || slotIndex >= 2)
+            return nullptr;
+        return loadedSampleForUI[(size_t) slotIndex];
+    }
+
+    int getOnsetCount (int slotIndex) const
+    {
+        if (slotIndex < 0 || slotIndex >= 2)
+            return 0;
+        return onsetCount[(size_t) slotIndex].load (std::memory_order_relaxed);
+    }
+
+    int getOnsetSample (int slotIndex, int onsetIndex) const
+    {
+        if (slotIndex < 0 || slotIndex >= 2)
+            return 0;
+        const int count = onsetCount[(size_t) slotIndex].load (std::memory_order_relaxed);
+        onsetIndex = juce::jlimit (0, juce::jmax (0, count - 1), onsetIndex);
+        return onsetSamples[(size_t) slotIndex][(size_t) onsetIndex];
+    }
+
+    std::function<void (int)> onSampleLoaded;
+    std::function<void (int)> onOnsetsAnalyzed;
 
 private:
     void updateSequencerCacheFromApvts();
     void updateEngineParamsFromApvts();
 
     juce::AudioFormatManager formatManager;
-    WarpingSamplerEngine samplerEngine;
+    DualWarpingSamplerEngine samplerEngine;
+    FxChain fxChain;
+    juce::dsp::Limiter<float> limiter;
     StepSequencer sequencer;
     juce::AudioProcessorValueTreeState apvts;
 
     juce::ThreadPool loaderPool { 1 };
 
     std::array<bool, 16> stepCache {};
+    std::array<int, 16> stepSamplerCache {};
+    std::array<int, 16> stepOnsetCache {};
+    std::array<float, 16> stepLengthMsCache {};
+
+    double internalPpq = 0.0;
 
     std::atomic<float>* speedParam = nullptr;
     std::atomic<float>* warpParam = nullptr;
     std::atomic<float>* sequenceLengthParam = nullptr;
     std::array<std::atomic<float>*, 16> stepParams {};
+    std::array<std::atomic<float>*, 16> stepSamplerParams {};
+    std::array<std::atomic<float>*, 16> stepOnsetParams {};
+    std::array<std::atomic<float>*, 16> stepLengthMsParams {};
 
-    SampleData::Ptr loadedSampleForUI;
-    std::atomic<SampleData*> sampleForAudio { nullptr };
+    std::atomic<float>* transportPlayParam = nullptr;
+    std::atomic<float>* tempoBpmParam = nullptr;
+    std::atomic<float>* autoLengthParam = nullptr;
+
+    std::atomic<float>* driveParam = nullptr;
+    std::atomic<float>* toneParam = nullptr;
+    std::atomic<float>* delayMixParam = nullptr;
+    std::atomic<float>* delayFeedbackParam = nullptr;
+    std::atomic<float>* delayTimeMsParam = nullptr;
+    std::atomic<float>* delaySyncParam = nullptr;
+    std::atomic<float>* delayDivisionParam = nullptr;
+    std::atomic<float>* reverbMixParam = nullptr;
+    std::atomic<float>* reverbRoomSizeParam = nullptr;
+    std::atomic<float>* reverbDampingParam = nullptr;
+
+    std::array<SampleData::Ptr, 2> loadedSampleForUI;
+    std::array<std::atomic<SampleData*>, 2> sampleForAudio { nullptr, nullptr };
+
+    static constexpr int maxOnsets = 256;
+    std::array<std::array<int, (size_t) maxOnsets>, 2> onsetSamples {};
+    std::array<std::atomic<int>, 2> onsetCount { 0, 0 };
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (PluginProcessor)
 };

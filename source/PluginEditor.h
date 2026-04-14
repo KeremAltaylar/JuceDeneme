@@ -4,9 +4,9 @@
 #include "BinaryData.h"
 #include "melatonin_inspector/melatonin_inspector.h"
 
-#include "DropZoneComponent.h"
-#include "WaveformComponent.h"
-#include "StepGridComponent.h"
+#include "SamplerTabComponent.h"
+#include "SequencerTabComponent.h"
+#include "FxTabComponent.h"
 
 //==============================================================================
 class PluginEditor : public juce::AudioProcessorEditor
@@ -26,21 +26,11 @@ private:
     std::unique_ptr<melatonin::Inspector> inspector;
     juce::TextButton inspectButton { "Inspect the UI" };
 
-    DropZoneComponent dropZone;
-    WaveformComponent waveform;
-
-    juce::Slider speedKnob;
-    juce::ToggleButton warpToggle { "Warp" };
-    juce::Slider sequenceLengthSlider;
-    StepGridComponent stepGrid;
-
-    using SliderAttachment = juce::AudioProcessorValueTreeState::SliderAttachment;
-    using ButtonAttachment = juce::AudioProcessorValueTreeState::ButtonAttachment;
-    std::unique_ptr<SliderAttachment> speedAttachment;
-    std::unique_ptr<ButtonAttachment> warpAttachment;
-    std::unique_ptr<SliderAttachment> sequenceLengthAttachment;
-
-    juce::File currentFile;
+    juce::TabbedComponent tabs { juce::TabbedButtonBar::TabsAtTop };
+    SamplerTabComponent sampler1;
+    SamplerTabComponent sampler2;
+    SequencerTabComponent sequencer;
+    FxTabComponent fx;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (PluginEditor)
 };

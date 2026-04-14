@@ -15,19 +15,45 @@ PluginProcessor::PluginProcessor()
 {
     formatManager.registerBasicFormats();
 
-    samplerEngine.setSampleSource (&sampleForAudio);
+    samplerEngine.setSampleSource (0, &sampleForAudio[0]);
+    samplerEngine.setSampleSource (1, &sampleForAudio[1]);
 
     speedParam = apvts.getRawParameterValue (ParameterIDs::speed);
     warpParam = apvts.getRawParameterValue (ParameterIDs::warp);
     sequenceLengthParam = apvts.getRawParameterValue (ParameterIDs::sequenceLength);
     for (int i = 0; i < 16; ++i)
         stepParams[(size_t) i] = apvts.getRawParameterValue (ParameterIDs::stepId (i));
+
+    transportPlayParam = apvts.getRawParameterValue (ParameterIDs::transportPlay);
+    tempoBpmParam = apvts.getRawParameterValue (ParameterIDs::tempoBpm);
+    autoLengthParam = apvts.getRawParameterValue (ParameterIDs::autoLength);
+
+    for (int i = 0; i < 16; ++i)
+    {
+        stepSamplerParams[(size_t) i] = apvts.getRawParameterValue (ParameterIDs::stepSamplerId (i));
+        stepOnsetParams[(size_t) i] = apvts.getRawParameterValue (ParameterIDs::stepOnsetId (i));
+        stepLengthMsParams[(size_t) i] = apvts.getRawParameterValue (ParameterIDs::stepLengthMsId (i));
+    }
+
+    driveParam = apvts.getRawParameterValue (ParameterIDs::drive);
+    toneParam = apvts.getRawParameterValue (ParameterIDs::tone);
+    delayMixParam = apvts.getRawParameterValue (ParameterIDs::delayMix);
+    delayFeedbackParam = apvts.getRawParameterValue (ParameterIDs::delayFeedback);
+    delayTimeMsParam = apvts.getRawParameterValue (ParameterIDs::delayTimeMs);
+    delaySyncParam = apvts.getRawParameterValue (ParameterIDs::delaySync);
+    delayDivisionParam = apvts.getRawParameterValue (ParameterIDs::delayDivision);
+    reverbMixParam = apvts.getRawParameterValue (ParameterIDs::reverbMix);
+    reverbRoomSizeParam = apvts.getRawParameterValue (ParameterIDs::reverbRoomSize);
+    reverbDampingParam = apvts.getRawParameterValue (ParameterIDs::reverbDamping);
 }
 
 PluginProcessor::~PluginProcessor()
 {
-    if (auto* old = sampleForAudio.exchange (nullptr, std::memory_order_acq_rel))
-        old->decReferenceCount();
+    for (auto& s : sampleForAudio)
+    {
+        if (auto* old = s.exchange (nullptr, std::memory_order_acq_rel))
+            old->decReferenceCount();
+    }
 }
 
 //==============================================================================
@@ -98,8 +124,12 @@ void PluginProcessor::changeProgramName (int index, const juce::String& newName)
 //==============================================================================
 void PluginProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
 {
-    samplerEngine.prepareToPlay (sampleRate, samplesPerBlock);
+    samplerEngine.prepare (sampleRate, samplesPerBlock, getTotalNumOutputChannels());
     sequencer.prepare (sampleRate);
+
+    fxChain.prepare (sampleRate, samplesPerBlock, getTotalNumOutputChannels());
+    juce::dsp::ProcessSpec spec { sampleRate, (juce::uint32) samplesPerBlock, (juce::uint32) getTotalNumOutputChannels() };
+    limiter.prepare (spec);
 }
 
 void PluginProcessor::releaseResources()
@@ -146,13 +176,42 @@ void PluginProcessor::processBlock (juce::AudioBuffer<float>& buffer,
 
     const int seqLen = (int) (sequenceLengthParam != nullptr ? sequenceLengthParam->load() : 16.0f);
 
+    const bool internalPlay = transportPlayParam != nullptr ? (transportPlayParam->load() >= 0.5f) : false;
+    double bpm = tempoBpmParam != nullptr ? (double) tempoBpmParam->load() : 120.0;
+    bool hostPlaying = false;
+    bool isPlaying = internalPlay;
+    double ppqStart = internalPpq;
+
+    if (auto* ph = getPlayHead())
+    {
+        if (auto pos = ph->getPosition())
+        {
+            hostPlaying = pos->getIsPlaying();
+            if (hostPlaying)
+            {
+                isPlaying = true;
+                if (auto hostBpm = pos->getBpm())
+                    if (*hostBpm > 0.0)
+                        bpm = *hostBpm;
+
+                if (auto hostPpq = pos->getPpqPosition())
+                    ppqStart = *hostPpq;
+            }
+        }
+    }
+
     std::array<StepSequencer::Event, 64> events {};
-    const int eventCount = sequencer.createEventsForBlock (
+    const int eventCount = sequencer.createStepStartEvents (
         events,
-        getPlayHead(),
         numSamples,
         seqLen,
-        stepCache);
+        isPlaying,
+        bpm,
+        ppqStart);
+
+    const bool autoLengthEnabled = autoLengthParam != nullptr ? (autoLengthParam->load() >= 0.5f) : true;
+    const double secondsPerBar = bpm > 0.0 ? (60.0 / bpm) * 4.0 : 2.0;
+    const int autoLengthSamples = (int) std::round ((secondsPerBar / (double) juce::jmax (1, seqLen)) * getSampleRate());
 
     int renderedUpTo = 0;
     for (int i = 0; i < eventCount; ++i)
@@ -165,14 +224,51 @@ void PluginProcessor::processBlock (juce::AudioBuffer<float>& buffer,
             renderedUpTo += segmentLen;
         }
 
-        if (e.noteOn)
-            samplerEngine.noteOn (60, 1.0f);
-        else
-            samplerEngine.noteOff (60, 0.0f, true);
+        const int stepIndex = juce::jlimit (0, 15, e.stepIndex);
+        if (stepCache[(size_t) stepIndex])
+        {
+            const int slot = juce::jlimit (0, 1, stepSamplerCache[(size_t) stepIndex]);
+            const int onsetIndex = juce::jmax (0, stepOnsetCache[(size_t) stepIndex]);
+            const int onsetSample = getOnsetSample (slot, onsetIndex);
+
+            const float lengthMsOverride = stepLengthMsCache[(size_t) stepIndex];
+            int lengthSamples = autoLengthSamples;
+            if (! autoLengthEnabled && lengthMsOverride > 0.0f)
+                lengthSamples = (int) std::round ((double) lengthMsOverride * 0.001 * getSampleRate());
+            else if (autoLengthEnabled && lengthMsOverride > 0.0f)
+                lengthSamples = (int) std::round ((double) lengthMsOverride * 0.001 * getSampleRate());
+
+            lengthSamples = juce::jlimit (1, (int) (getSampleRate() * 4.0), lengthSamples);
+            samplerEngine.trigger (slot, onsetSample, lengthSamples, 1.0f);
+        }
     }
 
     if (renderedUpTo < numSamples)
         samplerEngine.render (buffer, renderedUpTo, numSamples - renderedUpTo);
+
+    fxChain.setParameters (
+        driveParam != nullptr ? driveParam->load() : 0.0f,
+        toneParam != nullptr ? toneParam->load() : 4000.0f,
+        delayMixParam != nullptr ? delayMixParam->load() : 0.0f,
+        delayFeedbackParam != nullptr ? delayFeedbackParam->load() : 0.0f,
+        delayTimeMsParam != nullptr ? delayTimeMsParam->load() : 250.0f,
+        delaySyncParam != nullptr ? (delaySyncParam->load() >= 0.5f) : true,
+        delayDivisionParam != nullptr ? (int) delayDivisionParam->load() : 2,
+        reverbMixParam != nullptr ? reverbMixParam->load() : 0.0f,
+        reverbRoomSizeParam != nullptr ? reverbRoomSizeParam->load() : 0.5f,
+        reverbDampingParam != nullptr ? reverbDampingParam->load() : 0.5f,
+        bpm);
+
+    fxChain.process (buffer);
+
+    {
+        juce::dsp::AudioBlock<float> block (buffer);
+        juce::dsp::ProcessContextReplacing<float> ctx (block);
+        limiter.process (ctx);
+    }
+
+    if (! hostPlaying && internalPlay)
+        internalPpq += (bpm / (60.0 * getSampleRate())) * (double) numSamples;
 
     midiMessages.clear();
 }
@@ -207,6 +303,15 @@ void PluginProcessor::updateSequencerCacheFromApvts()
     {
         const auto* p = stepParams[(size_t) i];
         stepCache[(size_t) i] = (p != nullptr && p->load() >= 0.5f);
+
+        const auto* s = stepSamplerParams[(size_t) i];
+        stepSamplerCache[(size_t) i] = s != nullptr ? (int) s->load() : 0;
+
+        const auto* o = stepOnsetParams[(size_t) i];
+        stepOnsetCache[(size_t) i] = o != nullptr ? (int) o->load() : 0;
+
+        const auto* l = stepLengthMsParams[(size_t) i];
+        stepLengthMsCache[(size_t) i] = l != nullptr ? l->load() : 0.0f;
     }
 }
 
@@ -222,8 +327,9 @@ namespace
     class SampleLoadJob final : public juce::ThreadPoolJob
     {
     public:
-        SampleLoadJob (juce::AudioFormatManager& fm, juce::File f, std::function<void (SampleData::Ptr)> cb)
+        SampleLoadJob (juce::AudioFormatManager& fm, juce::File f, int slot, std::function<void (int, SampleData::Ptr)> cb)
             : ThreadPoolJob ("SampleLoadJob"), formatManager (fm), file (std::move (f)), callback (std::move (cb))
+            , slotIndex (slot)
         {
         }
 
@@ -232,7 +338,7 @@ namespace
             std::unique_ptr<juce::AudioFormatReader> reader (formatManager.createReaderFor (file));
             if (reader == nullptr)
             {
-                juce::MessageManager::callAsync ([cb = callback]() { cb (nullptr); });
+                juce::MessageManager::callAsync ([cb = callback, slot = slotIndex]() { cb (slot, nullptr); });
                 return jobHasFinished;
             }
 
@@ -240,7 +346,7 @@ namespace
             const juce::int64 numSamples64 = reader->lengthInSamples;
             if (numChannels <= 0 || numSamples64 <= 0 || numSamples64 > (juce::int64) (30 * reader->sampleRate))
             {
-                juce::MessageManager::callAsync ([cb = callback]() { cb (nullptr); });
+                juce::MessageManager::callAsync ([cb = callback, slot = slotIndex]() { cb (slot, nullptr); });
                 return jobHasFinished;
             }
 
@@ -248,34 +354,147 @@ namespace
             reader->read (&audio, 0, (int) numSamples64, 0, true, true);
 
             auto sample = SampleData::Ptr (new SampleData (std::move (audio), reader->sampleRate));
-            juce::MessageManager::callAsync ([cb = callback, sample]() { cb (sample); });
+            juce::MessageManager::callAsync ([cb = callback, sample, slot = slotIndex]() { cb (slot, sample); });
             return jobHasFinished;
         }
 
     private:
         juce::AudioFormatManager& formatManager;
         juce::File file;
-        std::function<void (SampleData::Ptr)> callback;
+        std::function<void (int, SampleData::Ptr)> callback;
+        int slotIndex = 0;
+    };
+
+    class OnsetAnalyzeJob final : public juce::ThreadPoolJob
+    {
+    public:
+        OnsetAnalyzeJob (SampleData::Ptr sampleIn, int slot, int maxOnsetsIn, std::function<void (int, std::array<int, 256>, int)> cb)
+            : ThreadPoolJob ("OnsetAnalyzeJob"), sample (std::move (sampleIn)), slotIndex (slot), maxOnsets (maxOnsetsIn), callback (std::move (cb))
+        {
+        }
+
+        JobStatus runJob() override
+        {
+            std::array<int, 256> onsets {};
+            int count = 0;
+
+            if (sample == nullptr)
+            {
+                juce::MessageManager::callAsync ([cb = callback, slot = slotIndex, onsets, count]() { cb (slot, onsets, count); });
+                return jobHasFinished;
+            }
+
+            const auto& audio = sample->getAudio();
+            const int numSamples = audio.getNumSamples();
+            const int numChannels = audio.getNumChannels();
+
+            if (numSamples <= 1 || numChannels <= 0)
+            {
+                juce::MessageManager::callAsync ([cb = callback, slot = slotIndex, onsets, count]() { cb (slot, onsets, count); });
+                return jobHasFinished;
+            }
+
+            const int frameSize = 1024;
+            const int hopSize = 512;
+            const int minInterval = 2048;
+            const double alpha = 0.01;
+            const double thresholdRatio = 3.0;
+            const double risingRatio = 1.5;
+
+            onsets[(size_t) count++] = 0;
+            int lastOnset = 0;
+            double meanEnergy = 0.0;
+            double lastEnergy = 0.0;
+
+            for (int pos = 0; pos + frameSize < numSamples; pos += hopSize)
+            {
+                double e = 0.0;
+                for (int ch = 0; ch < numChannels; ++ch)
+                {
+                    const float* x = audio.getReadPointer (ch) + pos;
+                    for (int i = 0; i < frameSize; ++i)
+                    {
+                        const double v = (double) x[i];
+                        e += v * v;
+                    }
+                }
+
+                if (meanEnergy == 0.0)
+                    meanEnergy = e;
+                else
+                    meanEnergy = (1.0 - alpha) * meanEnergy + alpha * e;
+
+                const bool isRising = (lastEnergy > 0.0) ? (e > lastEnergy * risingRatio) : true;
+                const bool isAbove = (meanEnergy > 0.0) ? (e > meanEnergy * thresholdRatio) : false;
+
+                if (isAbove && isRising && (pos - lastOnset) >= minInterval)
+                {
+                    if (count < juce::jmin (maxOnsets, (int) onsets.size()))
+                    {
+                        onsets[(size_t) count++] = pos;
+                        lastOnset = pos;
+                    }
+                    else
+                    {
+                        break;
+                    }
+                }
+
+                lastEnergy = e;
+            }
+
+            juce::MessageManager::callAsync ([cb = callback, slot = slotIndex, onsets, count]() { cb (slot, onsets, count); });
+            return jobHasFinished;
+        }
+
+    private:
+        SampleData::Ptr sample;
+        int slotIndex = 0;
+        int maxOnsets = 256;
+        std::function<void (int, std::array<int, 256>, int)> callback;
     };
 }
 
-void PluginProcessor::loadSampleFromFile (const juce::File& file)
+void PluginProcessor::loadSampleFromFile (int slotIndex, const juce::File& file)
 {
+    if (slotIndex < 0 || slotIndex >= 2)
+        return;
     if (! file.existsAsFile())
         return;
 
-    loaderPool.addJob (new SampleLoadJob (formatManager, file, [this] (SampleData::Ptr sample)
+    loaderPool.addJob (new SampleLoadJob (formatManager, file, slotIndex, [this] (int slot, SampleData::Ptr sample)
     {
-        loadedSampleForUI = sample;
+        loadedSampleForUI[(size_t) slot] = sample;
         auto* newRaw = sample.get();
         if (newRaw != nullptr)
             newRaw->incReferenceCount();
 
-        if (auto* old = sampleForAudio.exchange (newRaw, std::memory_order_acq_rel))
+        if (auto* old = sampleForAudio[(size_t) slot].exchange (newRaw, std::memory_order_acq_rel))
             old->decReferenceCount();
 
+        onsetCount[(size_t) slot].store (0, std::memory_order_relaxed);
         if (onSampleLoaded)
-            onSampleLoaded();
+            onSampleLoaded (slot);
+    }), true);
+}
+
+void PluginProcessor::analyzeOnsets (int slotIndex)
+{
+    if (slotIndex < 0 || slotIndex >= 2)
+        return;
+
+    auto sample = loadedSampleForUI[(size_t) slotIndex];
+    if (sample == nullptr)
+        return;
+
+    loaderPool.addJob (new OnsetAnalyzeJob (sample, slotIndex, maxOnsets, [this] (int slot, std::array<int, 256> onsets, int count)
+    {
+        const int safeCount = juce::jlimit (0, maxOnsets, count);
+        for (int i = 0; i < maxOnsets; ++i)
+            onsetSamples[(size_t) slot][(size_t) i] = (i < safeCount ? onsets[(size_t) i] : 0);
+        onsetCount[(size_t) slot].store (safeCount, std::memory_order_relaxed);
+        if (onOnsetsAnalyzed)
+            onOnsetsAnalyzed (slot);
     }), true);
 }
 
